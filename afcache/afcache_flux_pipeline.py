@@ -26,7 +26,7 @@ from xfuser.core.distributed.parallel_state import (
     is_pipeline_last_stage,
 )
 
-from afcache.afcache_flux import AdaptiveFeatureCache, afcache_flux_double_block_forward, afcache_flux_single_block_forward, cal_type_afcache
+from afcache_flux import AdaptiveFeatureCache, afcache_flux_double_block_forward, afcache_flux_single_block_forward, cal_type_afcache
 
 def main():
     parser = FlexibleArgumentParser(description="xFuser Arguments")
