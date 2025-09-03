@@ -26,7 +26,8 @@ from xfuser.core.distributed.parallel_state import (
     is_pipeline_last_stage,
 )
 
-from afcache_flux import AdaptiveFeatureCache, afcache_flux_double_block_forward, afcache_flux_single_block_forward, cal_type_afcache
+# 确保导入了修改后的afcache_flux
+from afcache_flux import AdaptiveFeatureCache, afcache_flux_double_block_forward, afcache_flux_single_block_forward
 
 logger = logging.get_logger(__name__)
 
@@ -73,10 +74,17 @@ def afcache_xfuser_flux_forward(
     if joint_attention_kwargs is None:
         joint_attention_kwargs = {}
     if joint_attention_kwargs.get("cache_dic", None) is None:
-        afcache = AdaptiveFeatureCache()
-        joint_attention_kwargs['cache_dic'], joint_attention_kwargs['current'] = afcache.cache_init(self)
+        # 将afcache实例附加到模型上，方便所有函数访问
+        self.afcache_instance = AdaptiveFeatureCache() 
+        joint_attention_kwargs['cache_dic'], joint_attention_kwargs['current'] = self.afcache_instance.cache_init(self)
 
-    cal_type_afcache(joint_attention_kwargs['cache_dic'], joint_attention_kwargs['current'])
+    current = joint_attention_kwargs['current']
+    cache_dic = joint_attention_kwargs['cache_dic']
+
+    # --- 核心改动：移除全局策略设定 ---
+    # 旧的 cal_type_afcache 调用被移除，因为策略选择已下沉到每个block内部
+    if current['step'] % cache_dic['fresh_threshold'] == 0 and current['step'] not in current['activated_steps']:
+        current['activated_steps'].append(current['step'])
 
     if joint_attention_kwargs is not None:
         joint_attention_kwargs = joint_attention_kwargs.copy()
@@ -85,7 +93,6 @@ def afcache_xfuser_flux_forward(
         lora_scale = 1.0
 
     if USE_PEFT_BACKEND:
-        # weight the lora layers by setting `lora_scale` for each PEFT layer
         scale_lora_layers(self, lora_scale)
     else:
         if (
@@ -137,7 +144,9 @@ def afcache_xfuser_flux_forward(
 
     for index_block, block in enumerate(self.transformer_blocks):
         joint_attention_kwargs['current']['layer'] = index_block
-
+        # 确保每个 block 能访问到 afcache 实例
+        block.afcache_instance = self.afcache_instance
+        
         if self.training and self.gradient_checkpointing:
             def create_custom_forward(module, return_dict=None):
                 def custom_forward(*inputs):
@@ -176,6 +185,7 @@ def afcache_xfuser_flux_forward(
 
     for index_block, block in enumerate(self.single_transformer_blocks):
         joint_attention_kwargs['current']['layer'] = index_block
+        block.afcache_instance = self.afcache_instance
 
         if self.training and self.gradient_checkpointing:
             def create_custom_forward(module, return_dict=None):
@@ -216,7 +226,6 @@ def afcache_xfuser_flux_forward(
         output = hidden_states, encoder_hidden_states
 
     if USE_PEFT_BACKEND:
-        # remove `lora_scale` from each PEFT layer
         unscale_lora_layers(self, lora_scale)
 
     joint_attention_kwargs['current']['step'] += 1
