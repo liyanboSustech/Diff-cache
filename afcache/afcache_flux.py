@@ -17,6 +17,14 @@ class AdaptiveFeatureCache:
         self.wavelet_levels = wavelet_levels
         self.wavelet_history_size = wavelet_history_size
         self.max_order = max_order
+        
+        # 添加维度限制参数 - 进一步降低限制以确保安全
+        self.max_dimension_per_chunk = 200  # 更保守的维度限制
+        self.enable_chunked_processing = True  # 启用分块处理
+        
+        # 添加简化 wavelet 选项作为备选
+        self.fallback_wavelets = ['haar', 'db1', 'db2']
+        self.current_wavelet_idx = 0
 
     def cache_init(self, transformer: FluxTransformer2DModel):
         cache_dic = {}
@@ -123,10 +131,77 @@ class AdaptiveFeatureCache:
             cache_dic['history'][stream][layer][module] = []
         
         history = cache_dic['history'][stream][layer][module]
-        history.append(feature.detach().cpu().numpy())
-        
+        feat_cpu = feature.detach().to(torch.float32).cpu()
+        history.append(feat_cpu.contiguous().numpy())
         if len(history) > self.wavelet_history_size:
             history.pop(0)
+
+    def _try_wavelet_with_fallback(self, signal_chunk, wavelet_name):
+        """尝试使用指定 wavelet，如果失败则尝试备选 wavelet"""
+        try:
+            # 限制分解层数以避免维度问题
+            max_levels = min(self.wavelet_levels, pywt.dwt_max_level(signal_chunk.shape[1], wavelet_name))
+            if max_levels <= 0:
+                return None
+                
+            coeffs = pywt.wavedec(signal_chunk, wavelet_name, level=max_levels, axis=1)
+            
+            # 预测系数
+            cA = coeffs[0]
+            if cA.shape[1] < 2:
+                return None
+                
+            cA_pred = cA[:, -1] + (cA[:, -1] - cA[:, -2])
+            
+            pred_coeffs = [cA_pred.reshape(-1, 1)]
+            for cD in coeffs[1:]:
+                pred_coeffs.append(np.zeros_like(cD[:, :1]))
+            
+            # 重构信号
+            reconstructed = pywt.waverec(pred_coeffs, wavelet_name, axis=1)
+            return reconstructed[:, 0]
+            
+        except (ValueError, RuntimeError) as e:
+            if "Maximum allowed dimension exceeded" in str(e) or "Invalid signal length" in str(e):
+                return None
+            else:
+                raise e
+
+    def _process_wavelet_chunk(self, signal_chunk):
+        """处理单个 wavelet 块，带有多级备选方案"""
+        # 首先尝试原始 wavelet
+        result = self._try_wavelet_with_fallback(signal_chunk, self.wavelet)
+        if result is not None:
+            return result
+            
+        # 如果失败，尝试备选 wavelets
+        for fallback_wavelet in self.fallback_wavelets:
+            result = self._try_wavelet_with_fallback(signal_chunk, fallback_wavelet)
+            if result is not None:
+                return result
+        
+        # 如果所有 wavelet 都失败，使用简单预测
+        return self._simple_predict_chunk(signal_chunk)
+
+    def _simple_predict_chunk(self, signal_chunk):
+        """简单预测方法作为备选方案"""
+        # 使用线性外推
+        if signal_chunk.shape[1] >= 2:
+            last_val = signal_chunk[:, -1]
+            second_last_val = signal_chunk[:, -2]
+            predicted = 2 * last_val - second_last_val
+            return predicted
+        else:
+            return signal_chunk[:, -1]
+
+    def _adaptive_chunk_size(self, total_elements):
+        """根据数据大小自适应调整块大小"""
+        if total_elements > 10000:
+            return min(self.max_dimension_per_chunk // 2, 100)
+        elif total_elements > 5000:
+            return min(self.max_dimension_per_chunk // 1.5, 150)
+        else:
+            return self.max_dimension_per_chunk
 
     def wavelet_predict(self, cache_dic, current):
         stream, layer, module = current['stream'], current['layer'], cache_dic['module_name']
@@ -135,25 +210,72 @@ class AdaptiveFeatureCache:
         if len(history) < self.wavelet_history_size:
             return None
 
-        device = next(self.parameters()).device if isinstance(self, torch.nn.Module) else 'cuda'
+        try:
+            device = next(self.parameters()).device if isinstance(self, torch.nn.Module) else 'cuda'
+        except:
+            device = 'cuda' if torch.cuda.is_available() else 'cpu'
         
-        signal = np.stack(history, axis=-1)
-        original_shape = signal.shape[:-1]
-        signal_flat = signal.reshape(-1, self.wavelet_history_size)
-        
-        coeffs = pywt.wavedec(signal_flat, self.wavelet, level=self.wavelet_levels, axis=1)
-        
-        cA = coeffs[0]
-        cA_pred = cA[:, -1] + (cA[:, -1] - cA[:, -2])
-        
-        pred_coeffs = [cA_pred.reshape(-1, 1)]
-        for cD in coeffs[1:]:
-            pred_coeffs.append(np.zeros_like(cD[:, :1]))
-        
-        reconstructed_flat = pywt.waverec(pred_coeffs, self.wavelet, axis=1)
-        
-        predicted_feature = torch.from_numpy(reconstructed_flat[:, 0]).reshape(original_shape).to(device)
-        return predicted_feature
+        try:
+            signal = np.stack(history, axis=-1)
+            original_shape = signal.shape[:-1]
+            signal_flat = signal.reshape(-1, self.wavelet_history_size)
+            
+            # 检查维度是否超出限制
+            total_elements = signal_flat.shape[0]
+            
+            # 如果数据太大，直接使用简单预测
+            if total_elements > self.max_dimension_per_chunk * 20:
+                print(f"Data too large ({total_elements}), using simple prediction")
+                predicted_flat = self._simple_predict_chunk(signal_flat)
+            
+            elif self.enable_chunked_processing and total_elements > self.max_dimension_per_chunk:
+                # 分块处理，使用自适应块大小
+                predicted_chunks = []
+                chunk_size = self._adaptive_chunk_size(total_elements)
+                
+                for i in range(0, total_elements, chunk_size):
+                    end_idx = min(i + chunk_size, total_elements)
+                    chunk = signal_flat[i:end_idx]
+                    
+                    try:
+                        predicted_chunk = self._process_wavelet_chunk(chunk)
+                        predicted_chunks.append(predicted_chunk)
+                    except Exception as e:
+                        print(f"Warning: Wavelet chunk processing failed: {e}")
+                        predicted_chunks.append(self._simple_predict_chunk(chunk))
+                
+                # 合并预测结果
+                if predicted_chunks:
+                    predicted_flat = np.concatenate(predicted_chunks, axis=0)
+                else:
+                    # 如果所有块都失败，使用最简单的预测
+                    predicted_flat = signal_flat[:, -1]
+            
+            else:
+                # 直接处理（维度较小的情况）
+                try:
+                    predicted_flat = self._process_wavelet_chunk(signal_flat)
+                except Exception as e:
+                    print(f"Warning: Direct wavelet processing failed: {e}")
+                    predicted_flat = self._simple_predict_chunk(signal_flat)
+            
+            # 恢复原始形状并转换为张量
+            predicted_feature = torch.from_numpy(predicted_flat).reshape(original_shape).to(device)
+            
+            # 数据类型和范围检查
+            if predicted_feature.dtype != torch.float32:
+                predicted_feature = predicted_feature.float()
+                
+            # 检查 NaN 和 Inf
+            if torch.any(torch.isnan(predicted_feature)) or torch.any(torch.isinf(predicted_feature)):
+                print("Warning: NaN or Inf detected in wavelet prediction, falling back to simple method")
+                return None
+                
+            return predicted_feature
+            
+        except Exception as e:
+            print(f"Warning: Wavelet prediction completely failed: {e}")
+            return None
 
 def afcache_flux_double_block_forward(self, hidden_states, encoder_hidden_states, temb, image_rotary_emb=None, joint_attention_kwargs=None):
     joint_attention_kwargs = joint_attention_kwargs or {}
@@ -192,16 +314,30 @@ def afcache_flux_double_block_forward(self, hidden_states, encoder_hidden_states
         afcache.update_feature_history(cache_dic, current, hidden_states)
 
     elif strategy == 'Wavelet':
-        pred_hs = afcache.wavelet_predict(cache_dic, current)
-        if pred_hs is not None:
-            hidden_states = pred_hs
-            # 注意: encoder_hidden_states 在此简化模型中未被预测，实际可能需要单独预测
-            # 为保持流程完整，我们假设它保持不变或使用简单策略
-        else: # 降级为 Taylor
-            hidden_states = afcache.taylor_formula(cache_dic, current)
+        try:
+            pred_hs = afcache.wavelet_predict(cache_dic, current)
+            if pred_hs is not None:
+                hidden_states = pred_hs
+                # 注意: encoder_hidden_states 在此简化模型中未被预测，实际可能需要单独预测
+                # 为保持流程完整，我们假设它保持不变或使用简单策略
+            else: # 降级为 Taylor
+                hidden_states = afcache.taylor_formula(cache_dic, current)
+        except Exception as e:
+            print(f"Warning: Wavelet prediction failed, falling back to Taylor: {e}")
+            try:
+                hidden_states = afcache.taylor_formula(cache_dic, current)
+            except Exception as e2:
+                print(f"Warning: Taylor formula also failed: {e2}, using input as fallback")
+                # 最后的备选方案：保持输入不变
+                pass
             
     elif strategy == 'Taylor':
-        hidden_states = afcache.taylor_formula(cache_dic, current)
+        try:
+            hidden_states = afcache.taylor_formula(cache_dic, current)
+        except Exception as e:
+            print(f"Warning: Taylor formula failed: {e}, using input as fallback")
+            # 保持输入不变作为最后备选
+            pass
 
     if hidden_states.dtype == torch.float16:
         hidden_states = hidden_states.clip(-65504, 65504)
@@ -237,19 +373,35 @@ def afcache_flux_single_block_forward(self, hidden_states, temb, image_rotary_em
         hidden_states = gate * calc_hidden_states
 
     elif strategy == 'Wavelet':
-        pred_hs = afcache.wavelet_predict(cache_dic, current)
-        if pred_hs is None: # 降级
-            pred_hs = afcache.taylor_formula(cache_dic, current)
-        
-        # Gate 也需要被缓存或预测，这里简化为使用上一步的
-        # 在一个完整的实现中，gate也应该被缓存
-        _, gate = self.norm(hidden_states, emb=temb) 
-        hidden_states = gate.unsqueeze(1) * pred_hs
+        try:
+            pred_hs = afcache.wavelet_predict(cache_dic, current)
+            if pred_hs is None: # 降级
+                pred_hs = afcache.taylor_formula(cache_dic, current)
+            
+            # Gate 也需要被缓存或预测，这里简化为使用上一步的
+            # 在一个完整的实现中，gate也应该被缓存
+            _, gate = self.norm(hidden_states, emb=temb) 
+            hidden_states = gate.unsqueeze(1) * pred_hs
+        except Exception as e:
+            print(f"Warning: Wavelet prediction failed, falling back to Taylor: {e}")
+            try:
+                pred_hs = afcache.taylor_formula(cache_dic, current)
+                _, gate = self.norm(hidden_states, emb=temb)
+                hidden_states = gate.unsqueeze(1) * pred_hs
+            except Exception as e2:
+                print(f"Warning: Taylor formula also failed: {e2}")
+                # 保持原始计算作为最后备选
+                pass
             
     elif strategy == 'Taylor':
-        pred_hs = afcache.taylor_formula(cache_dic, current)
-        _, gate = self.norm(hidden_states, emb=temb)
-        hidden_states = gate.unsqueeze(1) * pred_hs
+        try:
+            pred_hs = afcache.taylor_formula(cache_dic, current)
+            _, gate = self.norm(hidden_states, emb=temb)
+            hidden_states = gate.unsqueeze(1) * pred_hs
+        except Exception as e:
+            print(f"Warning: Taylor formula failed: {e}")
+            # 保持原始计算作为最后备选
+            pass
 
     hidden_states = residual + hidden_states
     
