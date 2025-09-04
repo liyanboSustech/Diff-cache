@@ -1,0 +1,37 @@
+model:
+  name: "DiT-XL/2"
+  patch_size: 2
+  hidden_size: 1152
+  depth: 28
+  num_heads: 16
+  mlp_ratio: 4.0
+
+fourier_cache:
+  compression_ratio: 0.3
+  preserve_dc: true
+  cache_type: "fourier_cache"
+  enable_spatial_analysis: true
+  enable_temporal_analysis: true
+
+frequency_analysis:
+  low_freq_threshold: 0.1
+  high_freq_threshold: 0.9
+  energy_preservation_ratio: 0.95
+
+prediction:
+  history_length: 4
+  prediction_steps: 2
+  use_frequency_extrapolation: true
+  spatial_predictor:
+    enabled: true
+    hidden_dim: 256
+
+cache_layers:
+  - "attn"
+  - "mlp"
+  - "transformer_blocks"
+
+performance:
+  enable_parallel_processing: true
+  use_fp16: true
+  memory_efficient: true

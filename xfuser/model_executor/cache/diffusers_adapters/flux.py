@@ -12,11 +12,26 @@ from xfuser.model_executor.cache.diffusers_adapters.registry import TRANSFORMER_
 
 from xfuser.model_executor.cache import utils
 
+# Try to import Fourier cache implementation
+try:
+    from fourier_cache.flux_adapter import create_fourier_cached_transformer_blocks
+    FOURIER_CACHE_AVAILABLE = True
+except ImportError:
+    FOURIER_CACHE_AVAILABLE = False
+
 def create_cached_transformer_blocks(use_cache, transformer, rel_l1_thresh, return_hidden_states_first, num_steps):
+    # Map cache types to their implementations
     cached_transformer_class = {
         "Fb": utils.FBCachedTransformerBlocks,
         "Tea": utils.TeaCachedTransformerBlocks,
     }.get(use_cache)
+
+    if use_cache == "Fourier":
+        if not FOURIER_CACHE_AVAILABLE:
+            raise ValueError("Fourier cache is not available. Please install the fourier_cache package.")
+        return create_fourier_cached_transformer_blocks(
+            use_cache, transformer, rel_l1_thresh, return_hidden_states_first, num_steps
+        )
 
     if not cached_transformer_class:
         raise ValueError(f"Unsupported use_cache value: {use_cache}")
