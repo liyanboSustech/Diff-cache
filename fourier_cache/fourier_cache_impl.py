@@ -1,6 +1,3 @@
-\"\"\"
-Fourier-based cache implementation for DiT models.
-\"\"\"
 import torch
 from torch import nn
 from xfuser.model_executor.cache import utils
@@ -8,7 +5,6 @@ from .simple_fft import fft_compress, fft_decompress, compute_frequency_energy
 
 
 class FourierCachedTransformerBlocks(utils.CachedTransformerBlocks):
-    \"\"\"Transformer blocks with Fourier-based caching.\"\"\"
     
     def __init__(
         self,
@@ -40,15 +36,12 @@ class FourierCachedTransformerBlocks(utils.CachedTransformerBlocks):
         self.compression_mask = None
         
     def get_start_idx(self) -> int:
-        \"\"\"Return the starting index for processing blocks.\"\"\"
         return 0
         
     def are_two_tensor_similar(self, t1: torch.Tensor, t2: torch.Tensor, threshold: float) -> torch.Tensor:
-        \"\"\"Check if two tensors are similar based on L1 distance.\"\"\"
         return self.l1_distance(t1, t2) < threshold
         
     def get_modulated_inputs(self, hidden_states, encoder_hidden_states, *args, **kwargs):
-        \"\"\"Get modulated inputs and handle caching.\"\"\"
         # For Fourier cache, we use the inputs directly
         original_hidden_states = hidden_states
         original_encoder_hidden_states = encoder_hidden_states
@@ -69,7 +62,6 @@ class FourierCachedTransformerBlocks(utils.CachedTransformerBlocks):
         )
         
     def process_blocks(self, start_idx: int, hidden: torch.Tensor, encoder: torch.Tensor, *args, **kwargs):
-        \"\"\"Process transformer blocks and apply Fourier compression to residuals.\"\"\"
         original_hidden = hidden.clone()
         original_encoder = encoder.clone() if encoder is not None else None
         
@@ -106,8 +98,7 @@ class FourierCachedTransformerBlocks(utils.CachedTransformerBlocks):
         return hidden, encoder
         
     def forward(self, hidden_states, encoder_hidden_states, *args, **kwargs):
-        \"\"\"Forward pass with Fourier-based caching.\"\"\"
-        self.callback_handler.trigger_event(\"on_forward_begin\", self)
+        self.callback_handler.trigger_event("on_forward_begin", self)
 
         # Get modulated inputs
         current_inputs, prev_compressed_data, orig_hidden, orig_encoder = \
@@ -118,7 +109,7 @@ class FourierCachedTransformerBlocks(utils.CachedTransformerBlocks):
         use_cache = self.cnt > 0 and (self.cnt % 2) == 0  # Use cache every 2 steps
         self.use_cache = torch.tensor(use_cache, dtype=torch.bool, device=hidden_states.device)
 
-        self.callback_handler.trigger_event(\"on_forward_remaining_begin\", self)
+        self.callback_handler.trigger_event("on_forward_remaining_begin", self)
         
         if self.use_cache and self.compressed_hidden_states_residual is not None:
             # Decompress cached residuals
@@ -143,7 +134,7 @@ class FourierCachedTransformerBlocks(utils.CachedTransformerBlocks):
             # Process blocks normally
             hidden, encoder = self.process_blocks(self.get_start_idx(), orig_hidden, orig_encoder, *args, **kwargs)
 
-        self.callback_handler.trigger_event(\"on_forward_end\", self)
+        self.callback_handler.trigger_event("on_forward_end", self)
         self.cnt += 1
         
         return ((hidden, encoder) if self.return_hidden_states_first else (encoder, hidden))

@@ -4,7 +4,6 @@ import torch.fft
 
 
 def fft_compress(tensor: torch.Tensor, compression_ratio: float = 0.5) -> tuple:
-    
     # For simplicity, we'll work with the last dimension
     dim = -1
     original_shape = tensor.shape
@@ -46,30 +45,22 @@ def fft_compress(tensor: torch.Tensor, compression_ratio: float = 0.5) -> tuple:
 
 
 def fft_decompress(compressed_tensor: torch.Tensor, mask: torch.Tensor, original_shape: tuple) -> torch.Tensor:
-    
     # Apply inverse FFT
     decompressed = torch.fft.ifft(compressed_tensor, dim=-1).real
-    
     return decompressed
 
 
 def compute_frequency_energy(tensor: torch.Tensor) -> dict:
-    
     fft_tensor = torch.fft.fft(tensor, dim=-1)
-    
     # Compute magnitude spectrum
     magnitude = torch.abs(fft_tensor)
-    
     # Compute energy distribution
     total_energy = torch.sum(magnitude ** 2)
     normalized_energy = magnitude ** 2 / total_energy
-    
     # Find dominant frequencies
     n = fft_tensor.shape[-1]
-    
     # DC component (index 0)
     dc_energy = normalized_energy[..., 0]
-    
     # Low frequency energy (first 10% of frequencies)
     low_freq_count = max(1, n // 10)
     low_freq_energy = torch.sum(normalized_energy[..., :low_freq_count], dim=-1)

@@ -1,6 +1,3 @@
-\"\"\"
-Fourier cache adapter for Flux transformer blocks.
-\"\"\"
 import functools
 import unittest
 from torch import nn
@@ -17,7 +14,6 @@ def create_fourier_cached_transformer_blocks(
     num_steps,
     compression_ratio=0.5
 ):
-    \"\"\"Create Fourier-cached transformer blocks.\"\"\"
     if use_cache != "Fourier":
         raise ValueError(f"Unsupported use_cache value: {use_cache}")
         
@@ -41,7 +37,6 @@ def apply_fourier_cache_on_transformer(
     num_steps=8,
     compression_ratio=0.5,
 ):
-    \"\"\"Apply Fourier cache to a Flux transformer.\"\"\"
     cached_transformer_blocks = nn.ModuleList([
         create_fourier_cached_transformer_blocks(
             "Fourier", 

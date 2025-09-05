@@ -5,40 +5,34 @@ from typing import Optional, Tuple
 
 
 def fft_1d(tensor: torch.Tensor, dim: int = -1) -> torch.Tensor:
-    
     return torch.fft.fft(tensor, dim=dim)
 
 
 def ifft_1d(tensor: torch.Tensor, dim: int = -1) -> torch.Tensor:
-    
     return torch.fft.ifft(tensor, dim=dim).real
 
 
 def fft_2d(tensor: torch.Tensor, dims: Tuple[int, int] = (-2, -1)) -> torch.Tensor:
-    
     return torch.fft.fft2(tensor, dim=dims)
 
 
 def ifft_2d(tensor: torch.Tensor, dims: Tuple[int, int] = (-2, -1)) -> torch.Tensor:
-    
     return torch.fft.ifft2(tensor, dim=dims).real
 
 
 def fft_3d(tensor: torch.Tensor, dims: Tuple[int, int, int] = (-3, -2, -1)) -> torch.Tensor:
-    
     return torch.fft.fftn(tensor, dim=dims)
 
 
 def ifft_3d(tensor: torch.Tensor, dims: Tuple[int, int, int] = (-3, -2, -1)) -> torch.Tensor:
-    
     return torch.fft.ifftn(tensor, dim=dims).real
 
 
 def compress_frequency(tensor: torch.Tensor, 
-                      compression_ratio: float = 0.5, 
-                      dim: int = -1,
-                      preserve_dc: bool = True) -> Tuple[torch.Tensor, torch.Tensor]:
-    
+                    compression_ratio: float = 0.5, 
+                    dim: int = -1,
+                    preserve_dc: bool = True) -> Tuple[torch.Tensor, torch.Tensor]:
+
     # Apply FFT if tensor is real
     is_real = not torch.is_complex(tensor)
     if is_real:
@@ -101,7 +95,6 @@ def decompress_frequency(compressed_tensor: torch.Tensor,
 
 def analyze_frequency_characteristics(tensor: torch.Tensor, 
                                    dim: int = -1) -> dict:
-    
     fft_tensor = fft_1d(tensor, dim=dim)
     
     # Compute magnitude spectrum
