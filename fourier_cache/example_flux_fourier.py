@@ -29,7 +29,7 @@ def main():
     if not XDI_T_AVAILABLE:
         print("Running in mock mode - demonstrating Fourier cache concept")
         # Run a simple test
-        from fourier_cache.test_fft import test_fft_compression, test_frequency_analysis
+        from test_fft import test_fft_compression, test_frequency_analysis
         test_fft_compression()
         test_frequency_analysis()
         return
