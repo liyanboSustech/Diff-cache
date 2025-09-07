@@ -49,7 +49,7 @@ def main():
         torch_dtype=torch.bfloat16,
         text_encoder_2=text_encoder_2,
     )
-
+    
     if args.enable_sequential_cpu_offload:
         pipe.enable_sequential_cpu_offload(gpu_id=local_rank)
         logging.info(f"rank {local_rank} sequential CPU offload enabled")
