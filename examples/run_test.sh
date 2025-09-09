@@ -10,7 +10,7 @@ declare -A MODEL_CONFIGS=(
     ["Pixart-alpha"]="pixartalpha_example.py /cfs/dit/PixArt-XL-2-1024-MS 20"
     ["Pixart-sigma"]="pixartsigma_example.py /cfs/dit/PixArt-Sigma-XL-2-2K-MS 20"
     ["Sd3"]="sd3_example.py /cfs/dit/stable-diffusion-3-medium-diffusers 20"
-    ["Flux"]="flux_example.py /home/lyb/FLUX.1-dev 28"
+    ["Flux"]="flux_example_test_everytimestep.py /home/lyb/FLUX.1-dev 28"
     ["HunyuanDiT"]="hunyuandit_example.py /cfs/dit/HunyuanDiT-v1.2-Diffusers 50"
     ["SDXL"]="sdxl_example.py /cfs/dit/stable-diffusion-xl-base-1.0 30"
 )
@@ -29,7 +29,7 @@ mkdir -p ./results
 TASK_ARGS="--height 1024 --width 1024 --no_use_resolution_binning"
 
 # cache args
-CACHE_ARGS="--use_teacache"
+# CACHE_ARGS="--use_teacache"
 # CACHE_ARGS="--use_fbcache"
 
 # On 8 gpus, pp=2, ulysses=2, ring=1, cfg_parallel=2 (split batch)

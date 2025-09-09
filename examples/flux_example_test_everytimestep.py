@@ -1,10 +1,10 @@
 import logging
 import time
+import os
 import torch
 import torch.distributed
 from transformers import T5EncoderModel
-from ..xfuser.model_executor.pipelines import xFuserFluxPipeline
-from ..xfuser.config import xFuserArgs
+from xfuser import xFuserFluxPipeline, xFuserArgs
 from xfuser.config import FlexibleArgumentParser
 from xfuser.core.distributed import (
     get_world_group,
@@ -50,6 +50,10 @@ def main():
         text_encoder_2=text_encoder_2,
     )
 
+    # 创建结果保存目录
+    os.makedirs("./results", exist_ok=True)
+    os.makedirs("./intermediates", exist_ok=True)  # 用于保存中间步骤图像
+
     if args.enable_sequential_cpu_offload:
         pipe.enable_sequential_cpu_offload(gpu_id=local_rank)
         logging.info(f"rank {local_rank} sequential CPU offload enabled")
@@ -82,17 +86,35 @@ def main():
         f"tp{engine_args.tensor_parallel_degree}_"
         f"pp{engine_args.pipefusion_parallel_degree}_patch{engine_args.num_pipeline_patch}"
     )
+    
     if input_config.output_type == "pil":
         dp_group_index = get_data_parallel_rank()
         num_dp_groups = get_data_parallel_world_size()
         dp_batch_size = (input_config.batch_size + num_dp_groups - 1) // num_dp_groups
-        if pipe.is_dp_last_group():
-            for i, image in enumerate(output.images):
+        
+        if pipe.is_dp_last_group() and output is not None:
+            # 保存最终结果（最后一个timestep）
+            for i, image in enumerate(output.images[-1:]):  # 取最后一张作为最终结果
                 image_rank = dp_group_index * dp_batch_size + i
                 image_name = f"flux_result_{parallel_info}_{image_rank}_tc_{engine_args.use_torch_compile}.png"
                 image.save(f"./results/{image_name}")
-                print(f"image {i} saved to ./results/{image_name}")
-
+                print("the length of output is:", len(output.images))
+                print(f"Final image {i} saved to ./results/{image_name}")
+            
+            # 保存所有中间步骤图像
+            for step, step_images in enumerate(output.images):
+                # 检查是否是列表中的图像批次（处理单张/批次情况）
+                if isinstance(step_images, list):
+                    batch_images = step_images
+                else:
+                    batch_images = [step_images]
+                    
+                for i, image in enumerate(batch_images):
+                    image_rank = dp_group_index * dp_batch_size + i
+                    # 文件名格式: 步骤_并行信息_图像编号.png
+                    image_name = f"step_{step:03d}_flux_{parallel_info}_{image_rank}_tc_{engine_args.use_torch_compile}.png"
+                    image.save(f"./intermediates/{image_name}")
+                    
     if get_world_group().rank == get_world_group().world_size - 1:
         print(
             f"epoch time: {elapsed_time:.2f} sec, parameter memory: {parameter_peak_memory/1e9:.2f} GB, memory: {peak_memory/1e9:.2f} GB"
