@@ -42,7 +42,7 @@ def main():
         logging.info(f"rank {local_rank} quantizing text encoder 2")
         quantize(text_encoder_2, weights=qfloat8)
         freeze(text_encoder_2)
-
+    
     pipe = xFuserFluxPipeline.from_pretrained(
         pretrained_model_name_or_path=engine_config.model_config.model,
         engine_config=engine_config,
@@ -129,7 +129,7 @@ def main():
         if pipe.is_dp_last_group():
             for i, image in enumerate(output.images):
                 image_rank = dp_group_index * dp_batch_size + i
-                image_name = f"flux_result_{parallel_info}_{image_rank}_tc_{engine_args.use_torch_compile}.png"
+                image_name = f"flux_result_timestep_{input_config.num_inference_steps}_{parallel_info}_image_rank{image_rank}_tc_{engine_args.use_torch_compile}.png"
                 image.save(f"./results/{image_name}")
                 print(f"image {i} saved to ./results/{image_name}")
 

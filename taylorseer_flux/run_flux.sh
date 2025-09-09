@@ -11,7 +11,7 @@ declare -A MODEL_CONFIGS=(
     # ["Pixart-alpha"]="pixartalpha_example.py /cfs/dit/PixArt-XL-2-1024-MS 20"
     # ["Pixart-sigma"]="pixartsigma_example.py /cfs/dit/PixArt-Sigma-XL-2-2K-MS 20"
     # ["Sd3"]="sd3_example.py /cfs/dit/stable-diffusion-3-medium-diffusers 20"
-    ["FLUX-TaylorSeer"]="./xfusers_taylorseer_flux.py /home/lyb/FLUX.1-dev 50"
+    ["FLUX-TaylorSeer"]="./xfusers_taylorseer_flux1.py /home/lyb/FLUX.1-dev 28"
     # ["Flux"]="flux_example.py black-forest-labs/FLUX.1-dev 28"
     # ["HunyuanDiT"]="hunyuandit_example.py /cfs/dit/HunyuanDiT-v1.2-Diffusers 50"
 )
