@@ -63,7 +63,7 @@ def main():
 
     parameter_peak_memory = torch.cuda.max_memory_allocated(device=f"cuda:{local_rank}")
 
-    pipe.prepare_run(input_config, steps=input_config.num_inference_steps)
+    pipe.prepare_run(input_config, steps=1)
 
     torch.cuda.reset_peak_memory_stats()
     start_time = time.time()
@@ -102,31 +102,11 @@ def main():
                 image.save(f"./results/{image_name}")
                 print(f"Final image {i} saved to ./results/{image_name}")
             
-            # 保存所有中间步骤图像
-            if hasattr(output, 'timestep_images') and output.timestep_images:
-                print(f"Found {len(output.timestep_images)} timestep images")
-                for step, step_images in enumerate(output.timestep_images):
-                    # 检查是否是列表中的图像批次（处理单张/批次情况）
-                    if isinstance(step_images, list):
-                        batch_images = step_images
-                    else:
-                        batch_images = [step_images]
-                        
-                    for i, image in enumerate(batch_images):
-                        image_rank = dp_group_index * dp_batch_size + i
-                        # 文件名格式: 步骤_并行信息_图像编号.png
-                        image_name = f"step_{step:03d}_flux_{parallel_info}_{image_rank}_tc_{engine_args.use_torch_compile}.png"
-                        image.save(f"./intermediates/{image_name}")
-                        print(f"Saved timestep {step} image {i} to ./intermediates/{image_name}")
-            else:
-                print("No timestep images found in output")
-                    
     if get_world_group().rank == get_world_group().world_size - 1:
         print(
             f"epoch time: {elapsed_time:.2f} sec, parameter memory: {parameter_peak_memory/1e9:.2f} GB, memory: {peak_memory/1e9:.2f} GB"
         )
     get_runtime_state().destroy_distributed_env()
-
 
 if __name__ == "__main__":
     main()
