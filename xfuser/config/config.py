@@ -62,6 +62,7 @@ class RuntimeConfig:
     use_fp8_t5_encoder: bool = False
     use_teacache: bool = False
     use_fbcache: bool = False
+    save_timestep_images: bool = False
 
     def __post_init__(self):
         check_packages()

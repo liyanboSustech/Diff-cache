@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import sys
 import os
 from typing import Any, Dict, List, Tuple, Callable, Optional, Union
 
@@ -43,7 +44,6 @@ from .register import xFuserPipelineWrapperRegister
 
 if is_torch_xla_available():
     import torch_xla.core.xla_model as xm
-
     XLA_AVAILABLE = True
 else:
     XLA_AVAILABLE = False
@@ -52,12 +52,50 @@ else:
 @xFuserPipelineWrapperRegister.register(FluxPipeline)
 class xFuserFluxPipeline(xFuserPipelineBaseWrapper):
 
+    # ========================= 新增：每步保存图像 =========================
+    def _save_timestep_image(self, latents: torch.Tensor, step: int,
+                         output_dir: str = "./intermediates"):
+        from xfuser.core.distributed import (
+            get_world_group, get_sp_group, get_sequence_parallel_world_size,
+            is_pipeline_last_stage,
+        )
+        import torch, os
+
+        # 1. 所有 SP rank 都必须到场！
+        print(f"[DEBUG] entry step={step}, world_rank={get_world_group().rank}, "
+            f"sp_rank={get_sp_group().rank_in_group}", flush=True)
+
+        # 2. 收集完整 latent
+        if get_sequence_parallel_world_size() > 1:
+            latents = get_sp_group().all_gather(latents, dim=-2)
+
+        # 仅 rank0 保存
+        if get_world_group().rank == 0:
+            os.makedirs(output_dir, exist_ok=True)
+        
+            latents = latents.contiguous()
+            B, L, C = latents.shape               # [1, 4096, 64]
+            h = w = int(np.sqrt(L)) * 2           # 128
+            print(f"[DEBUG] step={step}, latents.shape={latents.shape}, h=w={h}, C={C}")
+            # 正确 reshape
+            latents = latents.view(B, h//2, w//2, C//4, 2, 2).permute(0, 3, 1, 4, 2, 5).reshape(B, C//4, h, w)
+            latents = (latents / self.vae.config.scaling_factor) + self.vae.config.shift_factor
+            with torch.no_grad():
+                image = self.vae.decode(latents.to(self.vae.device), return_dict=False)[0]
+            image = self.image_processor.postprocess(image, output_type="pil")[0]
+            path = os.path.join(output_dir, f"step_{step:03d}.png")
+            image.save(path)
+            print(f"[DEBUG] step_{step:03d}.png saved", flush=True)
+
+        # 同步
+        torch.distributed.barrier(group=get_world_group().device_group)
+    # ========================= 原有 from_pretrained =========================
     @classmethod
     def from_pretrained(
         cls,
         pretrained_model_name_or_path: Optional[Union[str, os.PathLike]],
         engine_config: EngineConfig,
-        cache_args: Dict={},
+        cache_args: Dict = {},
         return_org_pipeline: bool = False,
         **kwargs,
     ):
@@ -66,6 +104,7 @@ class xFuserFluxPipeline(xFuserPipelineBaseWrapper):
             return pipeline
         return cls(pipeline, engine_config, cache_args)
 
+    # ========================= 原有 prepare_run =========================
     def prepare_run(
         self,
         input_config: InputConfig,
@@ -86,6 +125,7 @@ class xFuserFluxPipeline(xFuserPipelineBaseWrapper):
         )
         get_runtime_state().runtime_config.warmup_steps = warmup_steps
 
+    # ========================= 原有属性 =========================
     @property
     def guidance_scale(self):
         return self._guidance_scale
@@ -102,6 +142,7 @@ class xFuserFluxPipeline(xFuserPipelineBaseWrapper):
     def interrupt(self):
         return self._interrupt
 
+    # ========================= 原有 __call__ =========================
     @torch.no_grad()
     @xFuserPipelineBaseWrapper.check_model_parallel_state(cfg_parallel_available=False)
     @xFuserPipelineBaseWrapper.enable_data_parallel
@@ -128,13 +169,9 @@ class xFuserFluxPipeline(xFuserPipelineBaseWrapper):
         max_sequence_length: int = 512,
         **kwargs,
     ):
-        r"""Function invoked when calling the pipeline for generation."""
-        print("using new pipeline")
-        print("=======================================================================")
         height = height or self.default_sample_size * self.vae_scale_factor
         width = width or self.default_sample_size * self.vae_scale_factor
 
-        # 1. Check inputs
         self.check_inputs(
             prompt,
             prompt_2,
@@ -150,24 +187,14 @@ class xFuserFluxPipeline(xFuserPipelineBaseWrapper):
         self._joint_attention_kwargs = joint_attention_kwargs
         self._interrupt = False
 
-        # 2. Define call parameters
         if prompt is not None and isinstance(prompt, str):
             batch_size = 1
         elif prompt is not None and isinstance(prompt, list):
             batch_size = len(prompt)
         else:
-            batch_size = prompt_embeds.shape[0] if prompt_embeds is not None else 1
+            batch_size = prompt_embeds.shape[0]
         device = self._execution_device
 
-        #! 修复1：用实例变量存储中间图像（解决作用域问题），每次调用前清空
-        self.intermediate_images = []
-        #! 修复2：保存必要参数到实例变量，供子方法（_sync_pipeline/_async_pipeline）使用
-        self.current_output_type = output_type
-        self.current_height = height
-        self.current_width = width
-        self.current_batch_size = batch_size * num_images_per_prompt  # 总图像数（含多图/批次）
-
-        # Set runtime state
         get_runtime_state().set_input_parameters(
             height=height,
             width=width,
@@ -177,7 +204,6 @@ class xFuserFluxPipeline(xFuserPipelineBaseWrapper):
             split_text_embed_in_sp=get_pipeline_parallel_world_size() == 1,
         )
 
-        # 3. Encode prompt
         lora_scale = (
             self.joint_attention_kwargs.get("scale", None)
             if self.joint_attention_kwargs is not None
@@ -198,20 +224,18 @@ class xFuserFluxPipeline(xFuserPipelineBaseWrapper):
             lora_scale=lora_scale,
         )
 
-        # 4. Prepare latent variables
         num_channels_latents = self.transformer.config.in_channels // 4
         latents, latent_image_ids = self.prepare_latents(
-            self.current_batch_size,
+            batch_size * num_images_per_prompt,
             num_channels_latents,
             height,
             width,
-            prompt_embeds.dtype if prompt_embeds is not None else torch.float32,
+            prompt_embeds.dtype,
             device,
             generator,
             latents,
         )
 
-        # 5. Prepare timesteps
         sigmas = np.linspace(1.0, 1 / num_inference_steps, num_inference_steps)
         image_seq_len = latents.shape[1]
         mu = calculate_shift(
@@ -234,24 +258,21 @@ class xFuserFluxPipeline(xFuserPipelineBaseWrapper):
         )
         self._num_timesteps = len(timesteps)
 
-        # 6. Prepare guidance
         if self.transformer.config.guidance_embeds:
             guidance = torch.full(
                 [1], guidance_scale, device=device, dtype=torch.float32
             )
-            guidance = guidance.expand(self.current_batch_size)
+            guidance = guidance.expand(latents.shape[0])
         else:
             guidance = None
 
         num_pipeline_warmup_steps = get_runtime_state().runtime_config.warmup_steps
 
-        # 7. Denoising loop
         with self.progress_bar(total=num_inference_steps) as progress_bar:
             if (
                 get_pipeline_parallel_world_size() > 1
                 and len(timesteps) > num_pipeline_warmup_steps
             ):
-                # 先同步热身，再异步推理
                 latents = self._sync_pipeline(
                     latents=latents,
                     prompt_embeds=prompt_embeds,
@@ -279,7 +300,6 @@ class xFuserFluxPipeline(xFuserPipelineBaseWrapper):
                     callback_on_step_end_tensor_inputs=callback_on_step_end_tensor_inputs,
                 )
             else:
-                # 纯同步推理
                 latents = self._sync_pipeline(
                     latents=latents,
                     prompt_embeds=prompt_embeds,
@@ -295,60 +315,71 @@ class xFuserFluxPipeline(xFuserPipelineBaseWrapper):
                     sync_only=True,
                 )
 
-        # 8. Final output processing (return all intermediate images)
+        image = None
+
+        def process_latents(latents):
+            latents = self._unpack_latents(
+                latents, height, width, self.vae_scale_factor
+            )
+            latents = (
+                latents / self.vae.config.scaling_factor
+            ) + self.vae.config.shift_factor
+            return latents
+
+        if not output_type == "latent":
+            if get_runtime_state().runtime_config.use_parallel_vae and get_runtime_state().parallel_config.vae_parallel_size > 0:
+                latents = self.gather_latents_for_vae(latents)
+                if latents is not None:
+                    latents = process_latents(latents)
+                self.send_to_vae_decode(latents)
+            else:
+                if get_runtime_state().runtime_config.use_parallel_vae:
+                    latents = self.gather_broadcast_latents(latents)
+                    latents = process_latents(latents)
+                    image = self.vae.decode(latents, return_dict=False)[0]
+                else:
+                    if is_dp_last_group():
+                        latents = process_latents(latents)
+                        image = self.vae.decode(latents, return_dict=False)[0]
+
         if self.is_dp_last_group():
-            # 释放模型资源
+            if output_type == "latent":
+                image = latents
+            elif image is not None:
+                image = self.image_processor.postprocess(image, output_type=output_type)
             self.maybe_free_model_hooks()
 
-            # 处理输出格式（确保所有图像都是最终格式）
-            final_images = []
-            for img in self.intermediate_images:
-                if self.current_output_type == "latent":
-                    # 若输出latent，直接保留张量
-                    final_images.append(img)
-                else:
-                    # 若输出图像，确保是后处理后的格式（PIL/np.array）
-                    if isinstance(img, torch.Tensor):
-                        # 拆分批次图像（避免batch维度导致的格式错误）
-                        for i in range(img.shape[0]):
-                            single_img = self.image_processor.postprocess(img[i:i+1], output_type=self.current_output_type)
-                            final_images.append(single_img[0] if isinstance(single_img, list) else single_img)
-                    else:
-                        final_images.append(img)
-
             if not return_dict:
-                return (final_images,)  # 返回所有timestep的图像列表
-            return FluxPipelineOutput(images=final_images)
+                return (image,)
+
+            return FluxPipelineOutput(images=image)
         else:
             return None
 
+    # ========================= 原有 _init_sync_pipeline =========================
     def _init_sync_pipeline(
-        self, latents: torch.Tensor, latent_image_ids: torch.Tensor, 
+        self, latents: torch.Tensor, latent_image_ids: torch.Tensor,
         prompt_embeds: torch.Tensor, text_ids: torch.Tensor
     ):
         get_runtime_state().set_patched_mode(patch_mode=False)
 
-        # 拆分并重组latents（适配流水线并行）
         latents_list = [
             latents[:, start_idx:end_idx, :]
             for start_idx, end_idx in get_runtime_state().pp_patches_token_start_end_idx_global
         ]
         latents = torch.cat(latents_list, dim=-2)
-        
-        # 拆分并重组latent_image_ids
         latent_image_ids_list = [
             latent_image_ids[start_idx:end_idx]
             for start_idx, end_idx in get_runtime_state().pp_patches_token_start_end_idx_global
         ]
         latent_image_ids = torch.cat(latent_image_ids_list, dim=-2)
 
-        # 序列并行拆分文本嵌入
         if get_runtime_state().split_text_embed_in_sp:
             if prompt_embeds.shape[-2] % get_sequence_parallel_world_size() == 0:
                 prompt_embeds = torch.chunk(prompt_embeds, get_sequence_parallel_world_size(), dim=-2)[get_sequence_parallel_rank()]
             else:
                 get_runtime_state().split_text_embed_in_sp = False
-        
+
         if get_runtime_state().split_text_embed_in_sp:
             if text_ids.shape[-2] % get_sequence_parallel_world_size() == 0:
                 text_ids = torch.chunk(text_ids, get_sequence_parallel_world_size(), dim=-2)[get_sequence_parallel_rank()]
@@ -357,7 +388,7 @@ class xFuserFluxPipeline(xFuserPipelineBaseWrapper):
 
         return latents, latent_image_ids, prompt_embeds, text_ids
 
-    # 同步流水线推理（含中间图像保存）
+    # ========================= 原有 _sync_pipeline =========================
     def _sync_pipeline(
         self,
         latents: torch.Tensor,
@@ -373,21 +404,13 @@ class xFuserFluxPipeline(xFuserPipelineBaseWrapper):
         callback_on_step_end_tensor_inputs: List[str] = ["latents"],
         sync_only: bool = False,
     ):
-        # 初始化同步流水线参数
-        latents, latent_image_ids, prompt_embeds, text_ids = self._init_sync_pipeline(
-            latents, latent_image_ids, prompt_embeds, text_ids
-        )
-
+        latents, latent_image_ids, prompt_embeds, text_ids = self._init_sync_pipeline(latents, latent_image_ids, prompt_embeds, text_ids)
         for i, t in enumerate(timesteps):
             if self.interrupt:
                 continue
-
-            # 记录上一timestep的latents（用于
-            # 接上面的代码继续完善_sync_pipeline和_async_pipeline方法
             if is_pipeline_last_stage():
-                last_timestep_latents = latents.clone()  # 深拷贝避免后续修改影响
+                last_timestep_latents = latents
 
-            # 接收前一阶段的latent（并行逻辑）
             if get_pipeline_parallel_world_size() == 1:
                 pass
             elif is_pipeline_first_stage() and i == 0:
@@ -395,12 +418,15 @@ class xFuserFluxPipeline(xFuserPipelineBaseWrapper):
             else:
                 latents = get_pp_group().pipeline_recv()
                 if not is_pipeline_first_stage():
-                    encoder_hidden_state = get_pp_group().pipeline_recv(0, "encoder_hidden_state")
+                    encoder_hidden_state = get_pp_group().pipeline_recv(
+                        0, "encoder_hidden_state"
+                    )
 
-            # Transformer去噪前向传播
             latents, encoder_hidden_state = self._backbone_forward(
                 latents=latents,
-                encoder_hidden_states=(prompt_embeds if is_pipeline_first_stage() else encoder_hidden_state),
+                encoder_hidden_states=(
+                    prompt_embeds if is_pipeline_first_stage() else encoder_hidden_state
+                ),
                 pooled_prompt_embeds=pooled_prompt_embeds,
                 text_ids=text_ids,
                 latent_image_ids=latent_image_ids,
@@ -409,61 +435,47 @@ class xFuserFluxPipeline(xFuserPipelineBaseWrapper):
             )
 
             if is_pipeline_last_stage():
-                # 调度器更新latent（去噪步骤）
                 latents_dtype = latents.dtype
                 latents = self._scheduler_step(latents, last_timestep_latents, t)
-                if latents.dtype != latents_dtype and torch.backends.mps.is_available():
-                    latents = latents.to(latents_dtype)
 
-                # ! 修复3：生成当前timestep的图像并保存到实例变量
-                current_image = None
-                if self.current_output_type != "latent":
-                    # 1. 处理latent（缩放+偏移，匹配VAE输入）
-                    processed_latent = self._unpack_latents(
-                        latents, self.current_height, self.current_width, self.vae_scale_factor
-                    )
-                    processed_latent = (processed_latent / self.vae.config.scaling_factor) + self.vae.config.shift_factor
+                if latents.dtype != latents_dtype:
+                    if torch.backends.mps.is_available():
+                        latents = latents.to(latents_dtype)
 
-                    # 2. 兼容VAE并行：收集所有进程的latent后解码
-                    if get_runtime_state().runtime_config.use_parallel_vae:
-                        gathered_latent = self.gather_broadcast_latents(processed_latent)
-                        current_image = self.vae.decode(gathered_latent, return_dict=False)[0]
-                    else:
-                        current_image = self.vae.decode(processed_latent, return_dict=False)[0]
+                # >>>>>>>>>> 新增：每步保存图像 <<<<<<<<<<
+                self._save_timestep_image(latents, i)
 
-                    # 3. 图像后处理（转为PIL/np.array）
-                    current_image = self.image_processor.postprocess(current_image, output_type=self.current_output_type)
-                else:
-                    # 若输出latent，直接保存当前latent张量
-                    current_image = latents.clone()
-
-                # 插入列表头部（因timestep是倒序，保证最终列表是“噪声→清晰”的顺序）
-                self.intermediate_images.insert(0, current_image)
-
-                # 回调函数处理（保留原有逻辑）
                 if callback_on_step_end is not None:
-                    callback_kwargs = {k: locals()[k] for k in callback_on_step_end_tensor_inputs}
+                    callback_kwargs = {}
+                    for k in callback_on_step_end_tensor_inputs:
+                        callback_kwargs[k] = locals()[k]
                     callback_outputs = callback_on_step_end(self, i, t, callback_kwargs)
+
                     latents = callback_outputs.pop("latents", latents)
                     prompt_embeds = callback_outputs.pop("prompt_embeds", prompt_embeds)
 
-            # 更新进度条
-            if i == len(timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0):
+            if i == len(timesteps) - 1 or (
+                (i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0
+            ):
                 progress_bar.update()
 
             if XLA_AVAILABLE:
                 xm.mark_step()
 
-            # 发送当前latent到下一阶段（并行逻辑）
             if sync_only and is_pipeline_last_stage() and i == len(timesteps) - 1:
                 pass
             elif get_pipeline_parallel_world_size() > 1:
                 get_pp_group().pipeline_send(latents)
                 if not is_pipeline_last_stage():
-                    get_pp_group().pipeline_send(encoder_hidden_state, name="encoder_hidden_state")
+                    get_pp_group().pipeline_send(
+                        encoder_hidden_state, name="encoder_hidden_state"
+                    )
 
-        # 序列并行拼接结果
-        if sync_only and get_sequence_parallel_world_size() > 1 and is_pipeline_last_stage():
+        if (
+            sync_only
+            and get_sequence_parallel_world_size() > 1
+            and is_pipeline_last_stage()
+        ):
             sp_degree = get_sequence_parallel_world_size()
             sp_latents_list = get_sp_group().all_gather(latents, separate_tensors=True)
             latents_list = []
@@ -471,7 +483,9 @@ class xFuserFluxPipeline(xFuserPipelineBaseWrapper):
                 latents_list += [
                     sp_latents_list[sp_patch_idx][
                         :,
-                        get_runtime_state().pp_patches_token_start_idx_local[pp_patch_idx] : get_runtime_state().pp_patches_token_start_idx_local[pp_patch_idx + 1],
+                        get_runtime_state()
+                        .pp_patches_token_start_idx_local[pp_patch_idx] : get_runtime_state()
+                        .pp_patches_token_start_idx_local[pp_patch_idx + 1],
                         :,
                     ]
                     for sp_patch_idx in range(sp_degree)
@@ -480,7 +494,7 @@ class xFuserFluxPipeline(xFuserPipelineBaseWrapper):
 
         return latents
 
-    # 异步流水线推理（新增中间图像保存逻辑）
+    # ========================= 原有 _async_pipeline =========================
     def _async_pipeline(
         self,
         latents: torch.Tensor,
@@ -497,7 +511,6 @@ class xFuserFluxPipeline(xFuserPipelineBaseWrapper):
     ):
         if len(timesteps) == 0:
             return latents
-        
         num_pipeline_patch = get_runtime_state().num_pipeline_patch
         num_pipeline_warmup_steps = get_runtime_state().runtime_config.warmup_steps
         patch_latents, patch_latent_image_ids = self._init_async_pipeline(
@@ -506,18 +519,20 @@ class xFuserFluxPipeline(xFuserPipelineBaseWrapper):
             num_pipeline_warmup_steps=num_pipeline_warmup_steps,
             latent_image_ids=latent_image_ids,
         )
-        last_patch_latents = [None for _ in range(num_pipeline_patch)] if is_pipeline_last_stage() else None
+        last_patch_latents = (
+            [None for _ in range(num_pipeline_patch)]
+            if (is_pipeline_last_stage())
+            else None
+        )
 
         first_async_recv = True
         for i, t in enumerate(timesteps):
             if self.interrupt:
                 continue
-            
             for patch_idx in range(num_pipeline_patch):
                 if is_pipeline_last_stage():
-                    last_patch_latents[patch_idx] = patch_latents[patch_idx].clone()  # 深拷贝
+                    last_patch_latents[patch_idx] = patch_latents[patch_idx]
 
-                # 接收前一阶段数据
                 if is_pipeline_first_stage() and i == 0:
                     pass
                 else:
@@ -528,77 +543,73 @@ class xFuserFluxPipeline(xFuserPipelineBaseWrapper):
                         first_async_recv = False
 
                     if not is_pipeline_first_stage() and patch_idx == 0:
-                        last_encoder_hidden_states = get_pp_group().get_pipeline_recv_data(
-                            idx=patch_idx, name="encoder_hidden_states"
+                        last_encoder_hidden_states = (
+                            get_pp_group().get_pipeline_recv_data(
+                                idx=patch_idx, name="encoder_hidden_states"
+                            )
                         )
-                    patch_latents[patch_idx] = get_pp_group().get_pipeline_recv_data(idx=patch_idx)
+                    patch_latents[patch_idx] = get_pp_group().get_pipeline_recv_data(
+                        idx=patch_idx
+                    )
 
-                # Transformer去噪前向传播
-                patch_latents[patch_idx], next_encoder_hidden_states = self._backbone_forward(
-                    latents=patch_latents[patch_idx],
-                    encoder_hidden_states=(prompt_embeds if is_pipeline_first_stage() else last_encoder_hidden_states),
-                    pooled_prompt_embeds=pooled_prompt_embeds,
-                    text_ids=text_ids,
-                    latent_image_ids=patch_latent_image_ids[patch_idx],
-                    guidance=guidance,
-                    t=t,
+                patch_latents[patch_idx], next_encoder_hidden_states = (
+                    self._backbone_forward(
+                        latents=patch_latents[patch_idx],
+                        encoder_hidden_states=(
+                            prompt_embeds
+                            if is_pipeline_first_stage()
+                            else last_encoder_hidden_states
+                        ),
+                        pooled_prompt_embeds=pooled_prompt_embeds,
+                        text_ids=text_ids,
+                        latent_image_ids=patch_latent_image_ids[patch_idx],
+                        guidance=guidance,
+                        t=t,
+                    )
                 )
-
                 if is_pipeline_last_stage():
-                    # 调度器更新latent（去噪步骤）
                     latents_dtype = patch_latents[patch_idx].dtype
                     patch_latents[patch_idx] = self._scheduler_step(
-                        patch_latents[patch_idx], last_patch_latents[patch_idx], t
+                        patch_latents[patch_idx],
+                        last_patch_latents[patch_idx],
+                        t,
                     )
-                    if latents.dtype != latents_dtype and torch.backends.mps.is_available():
-                        patch_latents[patch_idx] = patch_latents[patch_idx].to(latents_dtype)
 
-                    # ! 修复4：异步流水线保存中间图像（合并所有patch后处理）
-                    if patch_idx == num_pipeline_patch - 1:  # 最后一个patch才合并处理
-                        # 合并所有patch的latent
-                        merged_latents = torch.cat(patch_latents, dim=-2)
-                        
-                        current_image = None
-                        if self.current_output_type != "latent":
-                            # 1. 处理latent（缩放+偏移）
-                            processed_latent = self._unpack_latents(
-                                merged_latents, self.current_height, self.current_width, self.vae_scale_factor
-                            )
-                            processed_latent = (processed_latent / self.vae.config.scaling_factor) + self.vae.config.shift_factor
+                    if patch_latents[patch_idx].dtype != latents_dtype:
+                        if torch.backends.mps.is_available():
+                            patch_latents[patch_idx] = patch_latents[patch_idx].to(latents_dtype)
 
-                            # 2. 解码latent为图像
-                            if get_runtime_state().runtime_config.use_parallel_vae:
-                                gathered_latent = self.gather_broadcast_latents(processed_latent)
-                                current_image = self.vae.decode(gathered_latent, return_dict=False)[0]
-                            else:
-                                current_image = self.vae.decode(processed_latent, return_dict=False)[0]
+                    # >>>>>>>>>> 新增：每步保存图像（仅 rank0） <<<<<<<<<<
+                    # 先合并 patch 再保存
+                    full_latents = torch.cat(patch_latents, dim=-2)
+                    self._save_timestep_image(full_latents, i)
 
-                            # 3. 图像后处理
-                            current_image = self.image_processor.postprocess(current_image, output_type=self.current_output_type)
-                        else:
-                            current_image = merged_latents.clone()
+                    if callback_on_step_end is not None:
+                        callback_kwargs = {}
+                        for k in callback_on_step_end_tensor_inputs:
+                            callback_kwargs[k] = locals()[k]
+                        callback_outputs = callback_on_step_end(
+                            self, i, t, callback_kwargs
+                        )
 
-                        # 插入列表头部（保持“噪声→清晰”顺序）
-                        self.intermediate_images.insert(0, current_image)
+                        latents = callback_outputs.pop("latents", latents)
+                        prompt_embeds = callback_outputs.pop(
+                            "prompt_embeds", prompt_embeds
+                        )
 
-                    # 回调函数处理
-                    if callback_on_step_end is not None and patch_idx == num_pipeline_patch - 1:
-                        callback_kwargs = {k: locals()[k] for k in callback_on_step_end_tensor_inputs}
-                        callback_outputs = callback_on_step_end(self, i, t, callback_kwargs)
-                        # 仅更新最后一个patch的latent（避免重复处理）
-                        patch_latents[patch_idx] = callback_outputs.pop("latents", patch_latents[patch_idx])
-                        prompt_embeds = callback_outputs.pop("prompt_embeds", prompt_embeds)
-
-                    # 发送数据到下一阶段（非最后一步）
                     if i != len(timesteps) - 1:
-                        get_pp_group().pipeline_isend(patch_latents[patch_idx], segment_idx=patch_idx)
+                        get_pp_group().pipeline_isend(
+                            patch_latents[patch_idx], segment_idx=patch_idx
+                        )
                 else:
-                    # 非最后阶段：发送数据到下一阶段
                     if patch_idx == 0:
-                        get_pp_group().pipeline_isend(next_encoder_hidden_states, name="encoder_hidden_states")
-                    get_pp_group().pipeline_isend(patch_latents[patch_idx], segment_idx=patch_idx)
+                        get_pp_group().pipeline_isend(
+                            next_encoder_hidden_states, name="encoder_hidden_states"
+                        )
+                    get_pp_group().pipeline_isend(
+                        patch_latents[patch_idx], segment_idx=patch_idx
+                    )
 
-                # 准备接收下一阶段数据
                 if is_pipeline_first_stage() and i == 0:
                     pass
                 else:
@@ -609,31 +620,36 @@ class xFuserFluxPipeline(xFuserPipelineBaseWrapper):
                     else:
                         if patch_idx == num_pipeline_patch - 1:
                             get_pp_group().recv_next()
-                        get_pp_group().recv_next()
 
                 get_runtime_state().next_patch()
 
-            # 更新进度条
-            if i == len(timesteps) - 1 or ((i + num_pipeline_warmup_steps + 1) > num_warmup_steps and 
-                (i + num_pipeline_warmup_steps + 1) % self.scheduler.order == 0):
+            if i == len(timesteps) - 1 or (
+                (i + num_pipeline_warmup_steps + 1) > num_warmup_steps
+                and (i + num_pipeline_warmup_steps + 1) % self.scheduler.order == 0
+            ):
                 progress_bar.update()
 
             if XLA_AVAILABLE:
                 xm.mark_step()
 
-        # 合并所有patch的latent作为最终结果
         latents = None
         if is_pipeline_last_stage():
             latents = torch.cat(patch_latents, dim=-2)
             if get_sequence_parallel_world_size() > 1:
                 sp_degree = get_sequence_parallel_world_size()
-                sp_latents_list = get_sp_group().all_gather(latents, separate_tensors=True)
+                sp_latents_list = get_sp_group().all_gather(
+                    latents, separate_tensors=True
+                )
                 latents_list = []
                 for pp_patch_idx in range(get_runtime_state().num_pipeline_patch):
                     latents_list += [
                         sp_latents_list[sp_patch_idx][
                             ...,
-                            get_runtime_state().pp_patches_token_start_idx_local[pp_patch_idx] : get_runtime_state().pp_patches_token_start_idx_local[pp_patch_idx + 1],
+                            get_runtime_state()
+                            .pp_patches_token_start_idx_local[
+                                pp_patch_idx
+                            ] : get_runtime_state()
+                            .pp_patches_token_start_idx_local[pp_patch_idx + 1],
                             :,
                         ]
                         for sp_patch_idx in range(sp_degree)
@@ -641,6 +657,7 @@ class xFuserFluxPipeline(xFuserPipelineBaseWrapper):
                 latents = torch.cat(latents_list, dim=-2)
         return latents
 
+    # ========================= 原有 _init_async_pipeline =========================
     def _init_async_pipeline(
         self,
         num_timesteps: int,
@@ -650,23 +667,33 @@ class xFuserFluxPipeline(xFuserPipelineBaseWrapper):
     ):
         get_runtime_state().set_patched_mode(patch_mode=True)
 
-        # 初始化patch级别的latent
         if is_pipeline_first_stage():
-            latents = get_pp_group().pipeline_recv() if num_pipeline_warmup_steps > 0 else latents
-            patch_latents = list(latents.split(get_runtime_state().pp_patches_token_num, dim=-2))
+            latents = (
+                get_pp_group().pipeline_recv()
+                if num_pipeline_warmup_steps > 0
+                else latents
+            )
+            patch_latents = list(
+                latents.split(get_runtime_state().pp_patches_token_num, dim=-2)
+            )
         elif is_pipeline_last_stage():
-            patch_latents = list(latents.split(get_runtime_state().pp_patches_token_num, dim=-2))
+            patch_latents = list(
+                latents.split(get_runtime_state().pp_patches_token_num, dim=-2)
+            )
         else:
-            patch_latents = [None for _ in range(get_runtime_state().num_pipeline_patch)]
+            patch_latents = [
+                None for _ in range(get_runtime_state().num_pipeline_patch)
+            ]
 
-        # 初始化patch级别的image_ids
         patch_latent_image_ids = list(
             latent_image_ids[start_idx:end_idx]
             for start_idx, end_idx in get_runtime_state().pp_patches_token_start_end_idx_global
         )
 
-        # 准备接收任务
-        recv_timesteps = num_timesteps - 1 if is_pipeline_first_stage() else num_timesteps
+        recv_timesteps = (
+            num_timesteps - 1 if is_pipeline_first_stage() else num_timesteps
+        )
+
         if is_pipeline_first_stage():
             for _ in range(recv_timesteps):
                 for patch_idx in range(get_runtime_state().num_pipeline_patch):
@@ -679,6 +706,7 @@ class xFuserFluxPipeline(xFuserPipelineBaseWrapper):
 
         return patch_latents, patch_latent_image_ids
 
+    # ========================= 原有 _backbone_forward =========================
     def _backbone_forward(
         self,
         latents: torch.Tensor,
@@ -689,10 +717,8 @@ class xFuserFluxPipeline(xFuserPipelineBaseWrapper):
         guidance,
         t: Union[float, torch.Tensor],
     ):
-        # 广播timestep到batch维度
         timestep = t.expand(latents.shape[0]).to(latents.dtype)
 
-        # Transformer前向传播
         ret = self.transformer(
             hidden_states=latents,
             timestep=timestep / 1000,
@@ -704,17 +730,22 @@ class xFuserFluxPipeline(xFuserPipelineBaseWrapper):
             joint_attention_kwargs=self.joint_attention_kwargs,
             return_dict=False,
         )[0]
-        
         if self.engine_config.parallel_config.dit_parallel_size > 1:
             noise_pred, encoder_hidden_states = ret
         else:
             noise_pred, encoder_hidden_states = ret, None
         return noise_pred, encoder_hidden_states
 
+    # ========================= 原有 _scheduler_step =========================
     def _scheduler_step(
         self,
         noise_pred: torch.Tensor,
         latents: torch.Tensor,
         t: Union[float, torch.Tensor],
     ):
-        return self.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
+        return self.scheduler.step(
+            noise_pred,
+            t,
+            latents,
+            return_dict=False,
+        )[0]

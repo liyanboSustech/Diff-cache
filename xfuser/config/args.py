@@ -115,7 +115,7 @@ class xFuserArgs:
     use_teacache: bool = False
     use_fbcache: bool = False
     use_fp8_t5_encoder: bool = False
-
+    save_timestep_images: bool = False
     @staticmethod
     def add_cli_args(parser: FlexibleArgumentParser):
         """Shared CLI arguments for xFuser engine."""
@@ -167,7 +167,11 @@ class xFuserArgs:
             action="store_true",
             help="Enable teacache to accelerate inference in a single card",
         )
-
+        runtime_group.add_argument(
+            "--save_timestep_images",
+            action="store_true",
+            help="Save intermediate images at each timestep.",
+        )
         # Parallel arguments
         parallel_group = parser.add_argument_group("Parallel Processing Options")
         runtime_group.add_argument(
@@ -400,6 +404,7 @@ class xFuserArgs:
             use_onediff=self.use_onediff,
             # use_profiler=self.use_profiler,
             use_fp8_t5_encoder=self.use_fp8_t5_encoder,
+            save_timestep_images=self.save_timestep_images,
         )
 
         parallel_config = ParallelConfig(

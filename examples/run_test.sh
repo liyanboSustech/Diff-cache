@@ -1,7 +1,6 @@
 set -x
 
 export PYTHONPATH=$PWD:$PYTHONPATH
-
 # Select the model type
 export MODEL_TYPE="Flux"
 # Configuration for different model types
@@ -55,7 +54,8 @@ PARALLEL_ARGS="--pipefusion_parallel_degree 1 --ulysses_degree 2 --ring_degree 2
 
 # export CUDA_VISIBLE_DEVICES=4,5,6,7
 
-torchrun --nproc_per_node=$N_GPUS ./examples/$SCRIPT \
+
+torchrun --nproc_per_node=4 ./examples/flux_example_test_everytimestep.py \
 --model $MODEL_ID \
 $PARALLEL_ARGS \
 $TASK_ARGS \

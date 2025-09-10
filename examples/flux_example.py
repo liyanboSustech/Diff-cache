@@ -3,8 +3,8 @@ import time
 import torch
 import torch.distributed
 from transformers import T5EncoderModel
-from ..xfuser.model_executor.pipelines import xFuserFluxPipeline
-from ..xfuser.config import xFuserArgs
+from xfuser.model_executor.pipelines import xFuserFluxPipeline
+from xfuser.config import xFuserArgs
 from xfuser.config import FlexibleArgumentParser
 from xfuser.core.distributed import (
     get_world_group,
