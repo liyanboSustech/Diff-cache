@@ -1,6 +1,8 @@
 import torch
 from typing import Optional, Tuple, Dict, Any
-from xfuser.core.cache_manager import CacheEntry, get_cache_manager
+from ..xfuser.core.cache_manager import CacheEntry, get_cache_manager
+from ..xfuser.core.cache_manager.cache_manager import CacheEntry
+from ..xfuser.core.cache_manager import get_cache_manager
 from .fft_ops import fft_1d, ifft_1d, compress_frequency, decompress_frequency, analyze_frequency_characteristics
 
 
