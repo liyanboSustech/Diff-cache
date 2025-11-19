@@ -1,4 +1,6 @@
 import logging
+import os
+import json
 import time
 import torch
 import torch.distributed as dist
@@ -27,6 +29,16 @@ from xfuser.core.distributed.parallel_state import (
 )
 
 from forwards import taylorseer_flux_single_block_forward, taylorseer_flux_double_block_forward, taylorseer_flux_forward, taylorseer_xfuser_flux_forward
+from cache_statistics import print_cache_statistics, get_cache_stats
+
+
+def _cache_variant_suffix(stats: Dict[str, Any]) -> str:
+    """Build filename suffix like maxorder4_fresh6 to tag outputs."""
+    max_order = stats.get("max_order")
+    fresh_threshold = stats.get("fresh_threshold")
+    max_part = f"maxorder{max_order}" if max_order is not None else "maxorderNA"
+    fresh_part = f"fresh{fresh_threshold}" if fresh_threshold is not None else "freshNA"
+    return f"{max_part}_{fresh_part}"
 
 def main():
     parser = FlexibleArgumentParser(description="xFuser Arguments")
@@ -122,6 +134,10 @@ def main():
         f"tp{engine_args.tensor_parallel_degree}_"
         f"pp{engine_args.pipefusion_parallel_degree}_patch{engine_args.num_pipeline_patch}"
     )
+    cache_stats_obj = get_cache_stats()
+    local_stats = cache_stats_obj.stats
+    variant_suffix = _cache_variant_suffix(local_stats)
+
     if input_config.output_type == "pil":
         dp_group_index = get_data_parallel_rank()
         num_dp_groups = get_data_parallel_world_size()
@@ -129,14 +145,38 @@ def main():
         if pipe.is_dp_last_group():
             for i, image in enumerate(output.images):
                 image_rank = dp_group_index * dp_batch_size + i
-                image_name = f"flux_result_timestep_{input_config.num_inference_steps}_{parallel_info}_image_rank{image_rank}_tc_{engine_args.use_torch_compile}.png"
+                image_name = (
+                    f"flux_result_timestep_{input_config.num_inference_steps}_{parallel_info}_"
+                    f"image_rank{image_rank}_tc_{engine_args.use_torch_compile}_{variant_suffix}.png"
+                )
                 image.save(f"./results/{image_name}")
                 print(f"image {i} saved to ./results/{image_name}")
 
-    if get_world_group().rank == get_world_group().world_size - 1:
+    world_group = get_world_group()
+    if dist.is_initialized():
+        gathered_stats = [None for _ in range(world_group.world_size)]
+        dist.all_gather_object(gathered_stats, local_stats)
+    else:
+        gathered_stats = [local_stats]
+
+    if world_group.rank == world_group.world_size - 1:
         print(
             f"epoch time: {elapsed_time:.2f} sec, parameter memory: {parameter_peak_memory/1e9:.2f} GB, memory: {peak_memory/1e9:.2f} GB"
         )
+        # 打印cache统计信息
+        print_cache_statistics()
+        stats_path = os.path.join("results", f"cache_stats_rank{world_group.rank}_{variant_suffix}.json")
+        cache_stats_obj.save_statistics(stats_path)
+
+    if world_group.rank == 0:
+        os.makedirs("results", exist_ok=True)
+        aggregated_path = os.path.join("results", f"cache_stats_all_ranks_{variant_suffix}.json")
+        aggregated_payload = [
+            {"rank": idx, "stats": stats_dict} for idx, stats_dict in enumerate(gathered_stats)
+        ]
+        with open(aggregated_path, "w") as f:
+            json.dump(aggregated_payload, f, indent=2)
+        print(f"Aggregated cache statistics saved to {aggregated_path}")
     get_runtime_state().destroy_distributed_env()
 
 

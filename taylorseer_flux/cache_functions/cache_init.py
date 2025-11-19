@@ -1,4 +1,32 @@
+import os
+
 from diffusers.models import FluxTransformer2DModel
+
+
+def _get_env_int(name: str):
+    value = os.getenv(name)
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except ValueError:
+        print(f"[TaylorSeer] Ignoring invalid environment variable {name}={value}")
+        return None
+
+
+def _apply_env_overrides(cache_dic):
+    """Allow overriding key TaylorSeer parameters via env vars for sweeps."""
+    max_order = _get_env_int("TAYLORSEER_MAX_ORDER")
+    if max_order is not None:
+        cache_dic['max_order'] = max(0, max_order)
+
+    first_enhance = _get_env_int("TAYLORSEER_FIRST_ENHANCE")
+    if first_enhance is not None:
+        cache_dic['first_enhance'] = max(0, first_enhance)
+
+    fresh_threshold = _get_env_int("TAYLORSEER_FRESH_THRESHOLD")
+    if fresh_threshold is not None:
+        cache_dic['fresh_threshold'] = max(0, fresh_threshold)
 def cache_init(self: FluxTransformer2DModel):   
     '''
     Initialization for cache.
@@ -93,5 +121,7 @@ def cache_init(self: FluxTransformer2DModel):
     current['activated_steps'] = [0]
     current['step'] = 0
     current['num_steps'] = self.num_steps
+
+    _apply_env_overrides(cache_dic)
 
     return cache_dic, current

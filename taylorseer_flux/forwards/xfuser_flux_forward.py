@@ -27,6 +27,7 @@ from xfuser.core.distributed.parallel_state import (
 )
 
 from cache_functions import cache_init, cal_type
+from cache_statistics import update_cache_statistics
 
 logger = logging.get_logger(__name__)
 
@@ -76,6 +77,11 @@ def taylorseer_xfuser_flux_forward(
         joint_attention_kwargs['cache_dic'], joint_attention_kwargs['current'] = cache_init(self)
 
     cal_type(joint_attention_kwargs['cache_dic'], joint_attention_kwargs['current'])
+    update_cache_statistics(
+        joint_attention_kwargs['cache_dic'],
+        joint_attention_kwargs['current'].get('type', 'unknown'),
+        joint_attention_kwargs['current']
+    )
 
     if joint_attention_kwargs is not None:
         joint_attention_kwargs = joint_attention_kwargs.copy()
